@@ -1,0 +1,541 @@
+
+Rakshak — Product Specification, Architecture & Implementation Plan
+====================================================================
+
+Project Overview
+----------------
+Rakshak is an AI-assisted legal & emotional support web application built with React (TypeScript) for the frontend and Supabase (Auth, Postgres, Storage, Edge Functions) for the backend. This document contains the full project specification, page-by-page details, database schema, Row-Level Security (RLS) policies, storage rules, API contracts, React component and hook design, deployment instructions, test plan, and environment variables.
+
+User Roles & Permissions (three types)
+-------------------------------------
+1. root (3 root users total)
+   - Full administrative access across the app.
+   - Can view and manage all teachers, students, reports, evidence, appointments, and audit logs.
+   - Can create, modify, and delete any user, seed data, RLS policies, and run maintenance operations.
+   - Can promote or demote teachers and students.
+
+2. teacher (many)
+   - Can view students' reports and evidence assigned to them or belonging to their classes.
+   - Can triage, comment, update status, assign counselors/teachers.
+   - Cannot see students' personal private fields unless granted permission; default is pseudonymous/limited PII.
+   - Can create appointments with students, mark completed, and add recommendations.
+   - Can view aggregate dashboards for their class/school only.
+
+3. student (many)
+   - Can file new reports (anonymous or identified).
+   - Can view counts: number of cases solved, number pending.
+   - Cannot view case details of other students (only their own full details).
+   - Can view their own submitted reports' statuses and evidence they uploaded.
+   - Can chat with the Emotional Bot and see aggregated legal info responses (no private case details from other students).
+
+Core Principles
+---------------
+- Least privilege by default.
+- All sensitive evidence stored in private Supabase Storage buckets, preferably with client-side encryption.
+- RLS policies enforce per-row access rights.
+- Auditing for critical actions.
+- Optionally integrate LLM for chat with PII redaction middleware.
+
+Project Deliverables (summary)
+------------------------------
+- Git repo scaffolded with React + TypeScript, TailwindCSS, React Router.
+- Supabase SQL migrations for tables, indexes, and RLS policies.
+- Supabase Storage bucket config and example client upload code.
+- Example Edge Functions: notifyTrustedContacts, processEvidence.
+- Frontend pages and components listed below.
+- Hooks: useAuth, useReports, useEvidenceUpload, useAdmin.
+- Tests: unit + e2e (Playwright/Cypress).
+- CI: GitHub Actions workflow.
+- README with env var list and deployment instructions.
+- Seed data: 3 root users, several teachers, several students.
+
+Pages & UI Details
+------------------
+1. Landing page (/)
+   - Purpose: showcase Rakshak features, CTA to sign up / login, "Get Help Now" SOS button.
+   - Components: FeatureCards, Testimonials, CTA Buttons, Footer.
+   - Visible for all (no auth needed).
+
+2. Auth pages (/login, /signup, /magic-link)
+   - Signup: email/password + optional role invitation (students typically sign up as students; teachers and roots created via admin).
+   - Login: email/password, magic link, Google OAuth.
+   - After login, redirect to dashboard based on role.
+
+3. Profile (/profile)
+   - Fields: display name, phone (encrypted), role (readonly unless root), org/class, emergency contacts (phone, email), consent flags.
+   - Students: can edit profile and emergency contacts.
+   - Teachers: can edit profile and class info.
+   - Root: can edit any profile.
+
+4. Student Dashboard (/dashboard/student)
+   - Summary KPIs: total reports submitted, solved count, pending count.
+   - Recent submission list (their own only): minimal metadata (title, status, date).
+   - "New Report" CTA.
+   - Chat link to Emotional Assistant.
+   - Privacy: student cannot see others' reports details.
+
+5. Teacher Dashboard (/dashboard/teacher)
+   - See class roster, list of students, list of reports for their students.
+   - Filters: status, priority, category, date range.
+   - Report detail view (for students in their class) with evidence thumbnails, timeline, comments.
+   - Controls: triage (change status), assign counselor/teacher, escalate to root, export CSV for assigned cases.
+
+6. Root Dashboard (/dashboard/root)
+   - Full administrative control: global reports view with search across all teachers and students.
+   - User management with ability to create the three root users.
+   - RLS management docs link and audit logs viewer.
+   - Bulk actions: export, mass assign, run data retention jobs.
+
+7. Report Creation (/report/new)
+   - Guided form with steps:
+     1. Category selection (legal, emotional, medical, other).
+     2. Title & description.
+     3. Is anonymous? (toggle) — if anonymous, reporter_id stored null and a reporter_secret token created locally for editing.
+     4. Location (optional) – city, optional coordinates.
+     5. Evidence upload (images, audio, documents) — client-side resize + optional encryption.
+     6. Consent & Submit (capture timestamped consent).
+   - After submit, create a `report` row, upload evidence to `evidence` bucket, insert `evidence` rows.
+
+8. Report Detail (/report/:id)
+   - Student: if owner, sees full details and evidence.
+   - Teacher: if assigned or student belongs to their class, sees full details.
+   - Root: sees everything.
+   - Actions: comment, change status, assign, download signed URLs (time-limited), request appointment.
+
+9. Chat (/chat)
+   - Two modes/tabs: Emotional Assistant and Legal Assistant.
+   - Persist message history in DB with privacy flags.
+   - PII redaction middleware before sending to external LLM.
+   - For students: suggestions, resources, "connect to teacher" CTA.
+   - For teachers/root: more advanced legal references and ability to link to a report.
+
+10. Appointments (/appointments)
+    - Create, view, cancel appointments.
+    - Calendar view (teachers see their scheduled sessions; root can view all).
+    - Integrate third-party calendar if requested.
+
+11. Admin Tools (/admin)
+    - User management, role assignments, audit logs, RLS policy helper, data retention jobs.
+    - Seed data management.
+
+12. Settings (/settings)
+    - App-level settings for notifications, privacy, export requests, two-factor auth optionally.
+
+Database Schema (DDL)
+---------------------
+-- NOTE: This DDL includes roles and fields for student/teacher/root distinctions.
+
+```sql
+-- Enable required extensions (run as supabase SQL)
+create extension if not exists pgcrypto;
+
+-- Profiles: linked to auth.users
+create table if not exists public.profiles (
+  id uuid references auth.users on delete cascade,
+  display_name text,
+  role text not null check (role in ('root','teacher','student')),
+  org text,
+  class text,
+  phone text, -- store encrypted value or store pointer to encrypted key
+  emergency_contacts jsonb,
+  is_verified boolean default false,
+  created_at timestamptz default now(),
+  primary key (id)
+);
+
+-- Reports
+create table if not exists public.reports (
+  id uuid default gen_random_uuid() primary key,
+  reporter_id uuid references public.profiles, -- null for anonymous
+  reporter_secret text, -- for anonymous report editing (store hashed token)
+  is_anonymous boolean default true,
+  title text,
+  description text,
+  category text check (category in ('legal','emotional','medical','other')),
+  status text default 'new' check (status in ('new','triaged','in_progress','resolved','closed')),
+  priority text default 'medium' check (priority in ('low','medium','high','emergency')),
+  assigned_to uuid references public.profiles,
+  teacher_owner uuid references public.profiles, -- which teacher/class owns the report
+  location jsonb,
+  metadata jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Evidence
+create table if not exists public.evidence (
+  id uuid default gen_random_uuid() primary key,
+  report_id uuid references public.reports on delete cascade,
+  storage_path text not null,
+  file_type text,
+  file_size int,
+  encrypted boolean default false,
+  encryption_meta jsonb, -- store encrypted key metadata if using client-side encryption
+  uploaded_by uuid references public.profiles,
+  created_at timestamptz default now()
+);
+
+-- Appointments
+create table if not exists public.appointments (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references public.profiles,
+  teacher_id uuid references public.profiles,
+  start_time timestamptz,
+  end_time timestamptz,
+  status text default 'booked' check (status in ('booked','completed','canceled')),
+  created_at timestamptz default now()
+);
+
+-- Audit logs
+create table if not exists public.audit_logs (
+  id uuid default gen_random_uuid() primary key,
+  actor_id uuid references public.profiles,
+  action text,
+  target_table text,
+  target_id uuid,
+  data jsonb,
+  created_at timestamptz default now()
+);
+
+-- Indexes
+create index if not exists idx_reports_reporter_id on public.reports (reporter_id);
+create index if not exists idx_reports_status_priority on public.reports (status, priority);
+create index if not exists idx_evidence_report_id on public.evidence (report_id);
+```
+
+Row-Level Security (RLS) Policies
+---------------------------------
+High level rules:
+- Roots (role = 'root') can see everything.
+- Teachers can see reports for students in their class or reports where teacher_owner = their id.
+- Students can see only:
+  - counts (aggregate) for other students (handled by an API or view), not row-level details, and
+  - full details for reports they created (reporter_id = their id), or anonymous reports they own via reporter_secret.
+- Anonymous reports: reporter_id null; store reporter_secret (hashed) and a client token to allow edits by owner.
+
+Example RLS SQL:
+
+```sql
+-- Enable RLS on tables
+alter table public.profiles enable row level security;
+alter table public.reports enable row level security;
+alter table public.evidence enable row level security;
+alter table public.appointments enable row level security;
+alter table public.audit_logs enable row level security;
+
+-- Profiles: select own profile or roots can select all
+create policy "profiles_select_self_or_root" on public.profiles for select
+  using (id = auth.uid() OR exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'root'));
+
+create policy "profiles_update_self_or_root" on public.profiles for update
+  using (id = auth.uid() OR exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'root'));
+
+-- Reports: roots: full access
+create policy "reports_select_root" on public.reports for select
+  using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'root'));
+
+create policy "reports_select_teacher" on public.reports for select
+  using (
+    exists (
+      select 1 from public.profiles t
+      where t.id = auth.uid()
+        and t.role = 'teacher'
+        and (
+          reports.teacher_owner = t.id
+          or (reports.reporter_id in (select id from public.profiles where class = t.class))
+        )
+    )
+  );
+
+-- Students can select their own reports
+create policy "reports_select_reporter" on public.reports for select
+  using (reporter_id = auth.uid());
+
+-- For anonymous reports: allow select if reporter_secret matches a provided claim
+-- NOTE: Supabase exposes `auth.jwt()` claims; a custom claim named 'reporter_token' could be used
+-- But an alternative: owner receives an edit link with signed URL and a short-lived JWT issued by Edge Function.
+
+-- Insert policies: authenticated users can create reports with reporter_id = auth.uid() or anonymous
+create policy "reports_insert_auth" on public.reports for insert
+  with check (
+    (
+      reporter_id = auth.uid()
+    )
+    OR
+    (
+      reporter_id IS NULL -- anonymous
+    )
+  );
+
+-- Update policies:
+-- Root can update anything
+create policy "reports_update_root" on public.reports for update
+  using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'root'));
+
+-- Teacher can update if teacher_owner = auth.uid()
+create policy "reports_update_teacher_owner" on public.reports for update
+  using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'teacher' and reports.teacher_owner = auth.uid()));
+
+-- Reporter can update own reports (but cannot change certain protected columns like status -> require teacher/root)
+create policy "reports_update_reporter" on public.reports for update
+  using (reporter_id = auth.uid())
+  with check (
+    reporter_id = auth.uid()
+    -- optionally restrict fields that can be changed by reporter using a trigger or function
+  );
+
+-- Evidence access: roots can access all
+create policy "evidence_select_root" on public.evidence for select
+  using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'root'));
+
+-- Teachers can access evidence for reports they own or their class
+create policy "evidence_select_teacher" on public.evidence for select
+  using (
+    exists (
+      select 1 from public.profiles t
+      where t.id = auth.uid()
+        and t.role = 'teacher'
+        and (
+          (select teacher_owner from public.reports r where r.id = public.evidence.report_id) = t.id
+          or (select (r.reporter_id in (select id from public.profiles where class = t.class)) from public.reports r where r.id = public.evidence.report_id)
+        )
+    )
+  );
+
+-- Reporters can access evidence they uploaded or for their reports
+create policy "evidence_select_reporter" on public.evidence for select
+  using (
+    uploaded_by = auth.uid()
+    or (select reporter_id from public.reports r where r.id = public.evidence.report_id) = auth.uid()
+  );
+```
+
+Supabase Storage & Bucket Rules
+-------------------------------
+- Create a private bucket `evidence`.
+- Only server-side or authorized users (via RLS checks and limited signed URLs) can create signed URLs.
+- Use Supabase Storage ACLs: private bucket with policy to prevent public reads.
+- Upload flow:
+  1. Client obtains upload URL (or directly uses `supabase.storage.from('evidence').upload(...)` with anon key).
+  2. If client-side encryption is used, encrypt the file, upload encrypted blob, store encryption metadata in `evidence.encryption_meta`.
+  3. Insert evidence row in DB.
+- Download flow:
+  - For authorized actor, create short-lived signed URL on the server or via supabase client (based on role and RLS check).
+  - Default signed URL expiry: short (e.g., 60 seconds) for sensitive data.
+
+Storage Rules (conceptual)
+- Bucket: `evidence` - private
+- Retention: mark evidence for deletion via `metadata->retention` and run Edge Function to delete after retention period.
+
+Client-Side Encryption (recommended)
+-----------------------------------
+- Use Web Crypto API to encrypt files on client:
+  1. Generate AES-GCM 256-bit key per-file.
+  2. Encrypt file blob with AES-GCM.
+  3. Export the raw key and encrypt the raw key with a server public key (e.g., RSA or with KMS).
+  4. Upload encrypted blob. Store encrypted key in `evidence.encryption_meta`.
+  5. To download/decrypt, retrieve encrypted key, decrypt using server private key or KMS (requires appropriate server side flow).
+- Example snippet (browser):
+```js
+// generate key
+const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+// export
+const rawKey = await crypto.subtle.exportKey('raw', key);
+// use key to encrypt file...
+```
+
+Frontend Architecture & API Contracts
+------------------------------------
+- supabaseClient.ts: central client
+- Hooks:
+  - useAuth(): returns { user, profile, role, signOut, signIn }
+  - useReports(): CRUD functions with optimistic updates and pagination
+  - useEvidenceUpload(): handles client-side resize, chunked upload, encryption, progress
+  - useAdmin(): admin-only utilities
+- Example supabaseClient.ts
+```ts
+import { createClient } from '@supabase/supabase-js';
+export const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY,
+  { auth: { persistSession: true } }
+);
+```
+
+Example React File Upload Flow (TypeScript)
+```ts
+export async function uploadEvidence(reportId: string, file: File, uploaderId?: string) {
+  const key = `reports/${reportId}/${Date.now()}_${file.name}`;
+  // Optional: encrypt file using WebCrypto here before upload.
+  const { data, error } = await supabase.storage.from('evidence').upload(key, file, { cacheControl: '3600', upsert: false });
+  if (error) throw error;
+
+  const { error: dbErr } = await supabase.from('evidence').insert([{
+    report_id: reportId,
+    storage_path: data.path,
+    file_type: file.type,
+    file_size: file.size,
+    uploaded_by: uploaderId ?? null
+  }]);
+  if (dbErr) throw dbErr;
+
+  return data;
+}
+```
+
+Edge Functions (examples)
+-------------------------
+1. notifyTrustedContacts(report_id): Find all trusted contacts of the reporter and send SMS/email if report.priority = 'emergency' (via Twilio/SendGrid).
+2. processEvidence(evidence_id): Generate thumbnails for images, create text-extraction for documents (OCR), and store metadata in evidence.encryption_meta.
+
+Chat / Bot Integration
+----------------------
+- Design two bots: Emotional and Legal.
+- Always run PII redaction before sending content to LLM by removing phone numbers, email addresses, names (use regex) and replacing them with placeholders.
+- Store bot messages in `bot_messages` table with `private` flag when messages contain PII (so admin only).
+- Provide toggle to disable external LLM usage for privacy-first deployments.
+
+Testing Plan
+------------
+- Unit tests: Vitest/Jest for React components and hooks.
+- Integration tests: API + Supabase (use test project or dockerized Postgres).
+- E2E tests: Playwright/Cypress flows: sign up, login, create report (anon + auth), upload evidence, teacher assign, root export, student counts check.
+- Test seed data: create 3 roots, 4 teachers, 12 students, a handful of reports (varied statuses).
+
+CI/CD (GitHub Actions)
+----------------------
+- Workflows:
+  - ci.yml: run lint -> run unit tests -> run build
+  - e2e.yml: build -> run e2e tests in Playwright
+  - deploy.yml: on merge to main, deploy to Vercel and run DB migration script (via supabase CLI or Edge Function)
+
+Environment Variables
+---------------------
+- VITE_SUPABASE_URL
+- VITE_SUPABASE_ANON_KEY
+- SUPABASE_SERVICE_ROLE_KEY (server only; never in client)
+- SUPABASE_URL
+- SUPABASE_ANON_KEY
+- OPENAI_API_KEY (optional)
+- SENDGRID_API_KEY (optional)
+- TWILIO_SID, TWILIO_AUTH_TOKEN (optional)
+- SERVER_PUBLIC_KEY (for encryption schemes)
+- NODE_ENV
+
+Security & Compliance Checklist
+-------------------------------
+- Default private storage for evidence.
+- Client-side encryption option for high-sensitivity data.
+- RLS policies enabled on all tables.
+- Audit logs for create/update/delete actions.
+- Short-lived signed URLs for downloads.
+- Consent recorded on report submission.
+- Regular reviews and key rotations; never store service_role keys in client.
+- Data retention policy; automated deletion via scheduled Edge Function if required.
+
+Example SQL Migrations (short)
+------------------------------
+-- See Database Schema section above for full SQL. Include these migrations in /supabase/migrations/NN_init.sql
+
+Seed Data (conceptual)
+----------------------
+- Create 3 root accounts (manually via SQL or admin panel)
+- Create several teacher accounts (role='teacher') and link class fields
+- Create several student accounts (role='student') and assign to classes
+- Create sample reports across categories and statuses
+
+Files & Repo Structure (suggested)
+----------------------------------
+rakshak/
+├─ README.md
+├─ package.json
+├─ tsconfig.json
+├─ vite.config.ts
+├─ tailwind.config.js
+├─ src/
+│  ├─ main.tsx
+│  ├─ App.tsx
+│  ├─ pages/
+│  │  ├─ Landing.tsx
+│  │  ├─ Login.tsx
+│  │  ├─ Signup.tsx
+│  │  ├─ StudentDashboard.tsx
+│  │  ├─ TeacherDashboard.tsx
+│  │  ├─ RootDashboard.tsx
+│  │  ├─ NewReport.tsx
+│  │  ├─ ReportDetail.tsx
+│  │  ├─ Chat.tsx
+│  │  └─ Profile.tsx
+│  ├─ components/
+│  │  ├─ AuthForm.tsx
+│  │  ├─ FileUploader.tsx
+│  │  ├─ EvidenceGallery.tsx
+│  │  ├─ ChatBot.tsx
+│  │  └─ AdminTable.tsx
+│  ├─ hooks/
+│  │  ├─ useAuth.ts
+│  │  ├─ useReports.ts
+│  │  └─ useEvidenceUpload.ts
+│  └─ lib/
+│     ├─ supabaseClient.ts
+│     └─ crypto.ts (client-side encryption helpers)
+├─ supabase/
+│  ├─ migrations/
+│  └─ edge-functions/
+└─ tests/
+   ├─ unit/
+   └─ e2e/
+
+Admin & Permission Details (concise)
+------------------------------------
+- root: role='root' in profiles table. In RLS queries, match p.role='root' to allow full access.
+- teacher: role='teacher'. Teachers can `SELECT` reports where `reports.teacher_owner = auth.uid()` OR where reporter is in the same class as teacher (profiles.class match).
+- student: role='student'. Students can `SELECT` only reports where `reporter_id = auth.uid()`. To get counts (solved/pending), create a secure view or function `public.student_report_counts(student_id uuid)` which performs aggregate counts and enforces that only the student or root/teacher with permission can call it.
+
+Example Aggregate view & function (counts)
+```sql
+create view public.student_report_counts_view as
+select reporter_id,
+       sum(case when status in ('resolved','closed') then 1 else 0 end) as solved_count,
+       sum(case when status not in ('resolved','closed') then 1 else 0 end) as pending_count
+from public.reports
+group by reporter_id;
+
+-- RLS/permissions: allow student to select only their row via policy or implement function:
+create function public.get_my_report_counts()
+returns table(solved_count int, pending_count int) as $$
+  select
+    sum(case when status in ('resolved','closed') then 1 else 0 end),
+    sum(case when status not in ('resolved','closed') then 1 else 0 end)
+  from public.reports where reporter_id = auth.uid();
+$$ language sql stable;
+```
+
+Example API Contracts (REST-like using Supabase JS)
+--------------------------------------------------
+- Create report
+  - POST /reports (client uses supabase.from('reports').insert(...))
+  - Body: { title, description, category, is_anonymous, location, metadata }
+- Upload evidence
+  - Client uploads to storage then inserts to `evidence` table.
+- Get report details
+  - GET /reports?id=eq.<id>, authorized via RLS
+- Get student counts
+  - rpc get_my_report_counts() or select from view
+
+Operational Notes
+-----------------
+- For anonymous editing, produce an edit link with a signed token that maps to the reporter_secret. Implement via Edge Function that signs JWT with service key, stores mapping to reporter_secret, and issues short-lived JWT for the client to use.
+- To protect PII when using LLMs, implement middleware to mask personal identifiers. Keep an option to remove masking for root users only.
+
+Appendix: Next Steps I can do for you right now
+----------------------------------------------
+I created a text file containing this complete specification and implementation plan.
+
+If you'd like next, I can:
+- generate the exact SQL migration file for Supabase (full content),
+- scaffold the React project file tree with starter files,
+- create `supabaseClient.ts` and a few core React components,
+- create GitHub Actions workflow templates,
+- or produce Edge Function code samples.
+

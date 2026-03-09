@@ -1,0 +1,69 @@
+import { Link, useLocation } from 'react-router-dom'
+import { useAuth } from '@/hooks/useAuth'
+import { useReports } from '@/hooks/useReports'
+import { format } from 'date-fns'
+import DashboardLayout from '@/components/ui/dashboard-with-collapsible-sidebar'
+
+export default function MyReports() {
+  const { user, profile } = useAuth()
+  const location = useLocation()
+  const { reports, loading } = useReports(user?.id, profile?.role)
+
+  const pathMatch = location.pathname.match(/\/dashboard\/(\w+)/)
+  const role = pathMatch ? pathMatch[1] : 'student'
+
+  return (
+    <DashboardLayout>
+      <div className="min-h-screen bg-gray-950 text-gray-100">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          <h1 className="text-3xl font-bold text-gray-100 mb-8">My Reports</h1>
+
+          {loading ? (
+            <div className="text-center py-12 text-gray-400">Loading...</div>
+          ) : reports.length === 0 ? (
+            <div className="rounded-2xl border border-gray-800 bg-gray-900 p-8 text-center">
+              <p className="text-gray-400 mb-4">You haven't filed any reports yet.</p>
+              <Link to={`/dashboard/${role}/report/new`} className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white font-semibold shadow-sm hover:shadow-cyan-500/30 border border-cyan-500/30 hover:scale-[1.02] transition-all">
+                File Your First Report
+              </Link>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {reports.map((report) => (
+                <Link
+                  key={report.id}
+                  to={`/report/${report.id}`}
+                  className="rounded-2xl border border-gray-800 bg-gray-900 p-6 block hover:border-cyan-600/40 hover:shadow-[0_0_20px_rgba(6,182,212,0.15)] transition-all"
+                >
+                  <div className="flex justify-between items-start">
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-lg mb-1 text-gray-100">{report.title}</h3>
+                      <p className="text-gray-400 text-sm mb-2 line-clamp-2">{report.description}</p>
+                      <div className="flex gap-2">
+                        <span className={`px-2 py-1 text-xs rounded-full border ${
+                          report.status === 'resolved' || report.status === 'closed'
+                            ? 'bg-emerald-900/30 border-emerald-700 text-emerald-300'
+                            : report.status === 'in_progress'
+                            ? 'bg-cyan-900/30 border-cyan-700 text-cyan-300'
+                            : 'bg-gray-800 border-gray-700 text-gray-300'
+                        }`}>
+                          {report.status}
+                        </span>
+                        <span className="px-2 py-1 text-xs rounded-full bg-purple-900/30 border border-purple-700 text-purple-300">
+                          {report.category}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="text-right text-sm text-gray-500">
+                      {format(new Date(report.created_at), 'MMM d, yyyy')}
+                    </div>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </DashboardLayout>
+  )
+}
